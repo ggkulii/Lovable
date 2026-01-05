@@ -73,12 +73,7 @@ def sign_in(email: str, password: str, session: requests.Session) -> AuthTokens:
 def apply_referral(id_token: str, referral_code: str, session: requests.Session):
     """Step 4: Apply the referral code."""
     url = f"{LOVABLE_API}/user/referral-code/use"
-    headers = {
-        "authorization": f"Bearer {id_token}",
-        "content-type": "application/json",
-        "origin": "https://lovable.dev",
-        "referer": "https://lovable.dev/",
-    }
+    headers = _auth_headers(id_token)
     payload = {"referral_code": referral_code}
     
     print(f"Applying referral code: {referral_code}...")
@@ -87,6 +82,65 @@ def apply_referral(id_token: str, referral_code: str, session: requests.Session)
         print("Success! Referral code applied.")
     else:
         print(f"Failed to apply referral code: {resp.text}")
+
+
+def _auth_headers(id_token: str) -> dict:
+    return {
+        "authorization": f"Bearer {id_token}",
+        "content-type": "application/json",
+        "origin": "https://lovable.dev",
+        "referer": "https://lovable.dev/",
+    }
+
+
+def _discover_project_id(id_token: str, session: requests.Session) -> str | None:
+    """Try to locate the first available project for the user."""
+    try:
+        resp = session.get(f"{LOVABLE_API}/projects", headers=_auth_headers(id_token))
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - best-effort discovery
+        print(f"Could not auto-discover project id: {exc}")
+        return None
+
+    data = resp.json()
+    if isinstance(data, list) and data:
+        project = data[0]
+    else:
+        project = None
+        for key in ("projects", "items", "data"):
+            projects = data.get(key) if isinstance(data, dict) else None
+            if projects:
+                project = projects[0]
+                break
+
+    if isinstance(project, dict):
+        return project.get("id") or project.get("project_id")
+    return None
+
+
+def publish_first_site(id_token: str, session: requests.Session, project_id: str | None = None):
+    """Step 5: Publish the user's first website to trigger advocate credits."""
+    resolved_project_id = project_id or _discover_project_id(id_token, session)
+    if not resolved_project_id:
+        print("No project id provided and auto-discovery failed. Skipping publish step.")
+        return
+
+    url = f"{LOVABLE_API}/projects/{resolved_project_id}/deployments"
+    params = {"async": "true"}
+
+    print(f"Publishing first website for project {resolved_project_id}...")
+    resp = session.post(url, params=params, headers=_auth_headers(id_token), json={})
+    if resp.ok:
+        payload = resp.json()
+        deployment_url = payload.get("url")
+        deployment_id = payload.get("deployment_id")
+        print("Publish request accepted.")
+        if deployment_id:
+            print(f"Deployment id: {deployment_id}")
+        if deployment_url:
+            print(f"Deployment URL: {deployment_url}")
+    else:
+        print(f"Failed to publish website: {resp.status_code} {resp.text}")
 
 def main():
     print("=== Lovable Full Flow: Register -> Verify -> Referral ===")
@@ -121,7 +175,12 @@ def main():
         # Small delay for backend sync
         time.sleep(1)
         apply_referral(tokens.id_token, referral_code, session)
-        
+
+        # Phase 4: Publish to award advocate credits
+        print("\nPublishing the first website to trigger advocate credits...")
+        project_id = input("Enter project ID to publish (leave blank to auto-detect): ").strip() or None
+        publish_first_site(tokens.id_token, session, project_id)
+
         print("\nAll steps completed successfully!")
         
     except Exception as e:
